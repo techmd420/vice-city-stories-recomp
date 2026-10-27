@@ -1,0 +1,89 @@
+name: macOS app
+
+on:
+  push:
+    branches: [main, macos-deployment-target]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # The oldest supported Apple Silicon image. The Homebrew SDL2, Vulkan loader and MoltenVK bundled
+    # into the app are built for the runner's macOS, so the runner sets the app's real minimum version.
+    runs-on: macos-15
+    timeout-minutes: 340
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: brew install cmake vulkan-headers vulkan-loader molten-vk shaderc sdl2
+
+      - name: Cache LGPL FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: out/ffmpeg-lgpl
+          key: ffmpeg-lgpl-${{ runner.os }}-${{ hashFiles('profiles/vcs/scripts/build_ffmpeg_macos.sh') }}
+
+      - name: Build VCSNative.app
+        run: profiles/vcs/scripts/build_macos.sh
+
+      - name: Check the app runs on macOS ${{ env.MACOSX_DEPLOYMENT_TARGET }} without Homebrew
+        run: |
+          set -eu
+          rm -rf check && mkdir check
+          ditto -x -k out/vcs/dist/VCSNative-macOS.zip check
+          python3 - "$MACOSX_DEPLOYMENT_TARGET" check <<'PY'
+          import os, re, subprocess, sys
+          target = tuple(int(x) for x in sys.argv[1].split("."))
+          bad, highest = [], (0,)
+          for root, _, files in os.walk(sys.argv[2]):
+              for name in files:
+                  path = os.path.join(root, name)
+                  if os.path.islink(path):
+                      continue
+                  if b"Mach-O" not in subprocess.run(["file", "-b", path], capture_output=True).stdout:
+                      continue
+                  loads = subprocess.run(["otool", "-l", path], capture_output=True, text=True).stdout
+                  for m in re.findall(r"\n\s+minos (\S+)|LC_VERSION_MIN_MACOSX\n\s+cmdsize \d+\n\s+version (\S+)", loads):
+                      v = tuple(int(x) for x in (m[0] or m[1]).split("."))
+                      highest = max(highest, v)
+                      if v > target:
+                          bad.append(f"{path}: needs macOS {'.'.join(map(str, v))}")
+                  for dep in subprocess.run(["otool", "-L", path], capture_output=True, text=True).stdout.splitlines()[1:]:
+                      dep = dep.strip().split(" (")[0]
+                      if dep.startswith(("/opt/homebrew", "/usr/local")):
+                          bad.append(f"{path}: links {dep}")
+          print("Highest minimum macOS in the bundle:", ".".join(map(str, highest)))
+          if bad:
+              print("\n".join(bad))
+              sys.exit(1)
+          PY
+          codesign --verify --strict --deep check/VCSNative.app
+
+      # Upload the ditto zip, not the .app folder: artifact uploads drop symlinks and exec bits.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VCSNative-macOS
+          path: out/vcs/dist/VCSNative-macOS.zip
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/vcs/dist/VCSNative-macOS.zip \
+            --title "VCSNative $GITHUB_REF_NAME (macOS ${MACOSX_DEPLOYMENT_TARGET}+)" --generate-notes \
+            || gh release upload "$GITHUB_REF_NAME" out/vcs/dist/VCSNative-macOS.zip --clobber
