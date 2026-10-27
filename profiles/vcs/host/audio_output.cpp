@@ -741,6 +741,20 @@ struct SubmitWorker {
     bool stop_requested{};
     bool started{};
     std::thread thread;
+
+    // Stops and joins the thread; safe to call more than once. A joinable
+    // std::thread that is destroyed calls std::terminate(), and this object is
+    // a function-local static, so without this every exit() that runs static
+    // destructors aborted with SIGABRT from ~SubmitWorker().
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop_requested = true;
+        }
+        cv.notify_one();
+        if (thread.joinable()) thread.join();
+    }
+    ~SubmitWorker() { stop(); }
 };
 
 SubmitWorker &submit_worker() {
@@ -1042,6 +1056,10 @@ void audio_output_reset_channel(std::uint32_t channel) {
 }
 
 void audio_output_shutdown() {
+    // Drain and join the submit worker before the device goes away. It only
+    // touches the channel queues, which are reset below, and audio_output_submit()
+    // cannot restart it afterwards because state.closed keeps ensure_device() failing.
+    submit_worker().stop();
     AudioState &state = audio_state();
     SDL_AudioDeviceID device = 0;
     {
